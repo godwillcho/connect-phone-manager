@@ -173,30 +173,33 @@ def batch_claim(
     client,
     s3_client,
     config: ConnectConfig,
-    phone_numbers: list[str],
+    phone_numbers: list[dict],
     number_type: str,
-    description: str | None = None,
 ) -> list[dict]:
     """
     Claim multiple phone numbers sequentially.
 
-    For each number: claim -> poll -> associate -> record to S3 CSV.
+    Each entry in phone_numbers is {"number": str, "description": str|None}.
+    For each: claim -> poll -> associate -> record to S3 CSV.
     Returns a list of per-number result dicts.
     """
     results: list[dict] = []
 
-    for phone_number in phone_numbers:
+    for entry in phone_numbers:
+        phone_number = entry["number"]
+        desc = entry.get("description")
         result: dict = {
             "phone_number": phone_number,
             "phone_number_id": None,
             "phone_number_arn": None,
+            "description": desc or "",
             "status": "failed",
             "error": None,
         }
 
         # 1. Claim
         try:
-            resp = claim_phone_number(client, config, phone_number, description)
+            resp = claim_phone_number(client, config, phone_number, desc)
         except ClientError as exc:
             result["error"] = str(exc)
             logger.error("Claim failed for %s: %s", phone_number, exc)
@@ -242,7 +245,7 @@ def batch_claim(
             "contact_flow_arn": config.contact_flow_arn,
             "instance_id": config.instance_id,
             "instance_arn": config.instance_arn,
-            "description": description or "",
+            "description": desc or "",
             "status": status,
         })
 

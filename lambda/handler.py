@@ -121,7 +121,6 @@ def _handle_claim(client, s3_client, config, event: dict) -> dict:
         config,
         phone_numbers=event["phone_numbers"],
         number_type=event["number_type"],
-        description=event.get("description"),
     )
     claimed = sum(1 for r in results if r["status"] == "claimed")
     failed = len(results) - claimed

@@ -312,12 +312,28 @@ Resources:
                   pns = event.get("phone_numbers")
                   if not isinstance(pns, list) or len(pns) == 0:
                       raise ValueError("'phone_numbers' must be a non-empty list")
-                  for i, pn in enumerate(pns):
-                      if not isinstance(pn, str) or not pn.startswith("+"):
-                          raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
-                  desc = event.get("description")
-                  if desc is not None and not isinstance(desc, str):
+                  # Normalise phone_numbers to list of {"number": str, "description": str|None}
+                  # Accepts: "+1555..." OR {"number": "+1555...", "description": "..."}
+                  default_desc = event.get("description")
+                  if default_desc is not None and not isinstance(default_desc, str):
                       raise ValueError("'description' must be a string")
+                  normalised = []
+                  for i, pn in enumerate(pns):
+                      if isinstance(pn, str):
+                          if not pn.startswith("+"):
+                              raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
+                          normalised.append({"number": pn, "description": default_desc})
+                      elif isinstance(pn, dict):
+                          num = pn.get("number", "")
+                          if not isinstance(num, str) or not num.startswith("+"):
+                              raise ValueError(f"phone_numbers[{i}].number must be E.164 (start with '+')")
+                          desc = pn.get("description", default_desc)
+                          if desc is not None and not isinstance(desc, str):
+                              raise ValueError(f"phone_numbers[{i}].description must be a string")
+                          normalised.append({"number": num, "description": desc})
+                      else:
+                          raise ValueError(f"phone_numbers[{i}] must be a string or object with 'number' and optional 'description'")
+                  event["phone_numbers"] = normalised
               elif action == "release":
                   pids = event.get("phone_number_ids")
                   if not isinstance(pids, list) or len(pids) == 0:
@@ -469,12 +485,14 @@ Resources:
               logger.info("Released %s", pn_id)
 
           # ── Batch claim ───────────────────────────────────────
-          def batch_claim(client, s3c, config, phone_numbers, number_type, description=None):
+          def batch_claim(client, s3c, config, phone_numbers, number_type):
               results = []
-              for pn in phone_numbers:
-                  result = {"phone_number": pn, "phone_number_id": None, "phone_number_arn": None, "status": "failed", "error": None}
+              for entry in phone_numbers:
+                  pn = entry["number"]
+                  desc = entry.get("description")
+                  result = {"phone_number": pn, "phone_number_id": None, "phone_number_arn": None, "description": desc or "", "status": "failed", "error": None}
                   try:
-                      resp = claim_phone_number(client, config, pn, description)
+                      resp = claim_phone_number(client, config, pn, desc)
                   except ClientError as exc:
                       result["error"] = str(exc)
                       logger.error("Claim failed for %s: %s", pn, exc)
@@ -506,7 +524,7 @@ Resources:
                       "number_type": number_type, "phone_number_id": pn_id,
                       "phone_number_arn": pn_arn, "contact_flow_arn": config.contact_flow_arn,
                       "instance_id": config.instance_id, "instance_arn": config.instance_arn,
-                      "description": description or "", "status": status,
+                      "description": desc or "", "status": status,
                   })
                   results.append(result)
               return results
@@ -573,7 +591,7 @@ Resources:
                       nums = search_available_numbers(cc, config, event.get("number_type", "DID"), event.get("prefix"), event.get("max_results", 10))
                       return _response(200, {"available_numbers": nums, "count": len(nums)})
                   elif action == "claim":
-                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"], event.get("description"))
+                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
                       ok = sum(1 for r in res if r["status"] == "claimed")
                       return _response(200, {"results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
                   elif action == "release":

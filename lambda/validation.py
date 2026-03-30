@@ -73,15 +73,35 @@ def _validate_claim(event: dict) -> None:
     if not isinstance(phone_numbers, list) or len(phone_numbers) == 0:
         raise ValueError("'phone_numbers' must be a non-empty list of E.164 phone numbers")
 
-    for idx, pn in enumerate(phone_numbers):
-        if not isinstance(pn, str) or not pn.startswith("+"):
-            raise ValueError(
-                f"phone_numbers[{idx}] must be an E.164 string starting with '+', got '{pn}'"
-            )
-
-    desc = event.get("description")
-    if desc is not None and not isinstance(desc, str):
+    # Normalise phone_numbers to list of {"number": str, "description": str|None}
+    # Accepts: "+1555..." OR {"number": "+1555...", "description": "..."}
+    default_desc = event.get("description")
+    if default_desc is not None and not isinstance(default_desc, str):
         raise ValueError("'description' must be a string")
+
+    normalised = []
+    for idx, pn in enumerate(phone_numbers):
+        if isinstance(pn, str):
+            if not pn.startswith("+"):
+                raise ValueError(
+                    f"phone_numbers[{idx}] must be E.164 (start with '+'), got '{pn}'"
+                )
+            normalised.append({"number": pn, "description": default_desc})
+        elif isinstance(pn, dict):
+            num = pn.get("number", "")
+            if not isinstance(num, str) or not num.startswith("+"):
+                raise ValueError(
+                    f"phone_numbers[{idx}].number must be E.164 (start with '+')"
+                )
+            desc = pn.get("description", default_desc)
+            if desc is not None and not isinstance(desc, str):
+                raise ValueError(f"phone_numbers[{idx}].description must be a string")
+            normalised.append({"number": num, "description": desc})
+        else:
+            raise ValueError(
+                f"phone_numbers[{idx}] must be a string or object with 'number' and optional 'description'"
+            )
+    event["phone_numbers"] = normalised
 
 
 def _validate_release(event: dict) -> None:
