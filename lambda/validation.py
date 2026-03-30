@@ -73,10 +73,11 @@ def _validate_claim(event: dict) -> None:
     if not isinstance(phone_numbers, list) or len(phone_numbers) == 0:
         raise ValueError("'phone_numbers' must be a non-empty list of E.164 phone numbers")
 
-    # Normalise phone_numbers to list of {"number": str, "description": str|None}
+    # Normalise phone_numbers to list of {"number": str, "description": str}
     # Accepts: "+1555..." OR {"number": "+1555...", "description": "..."}
-    default_desc = event.get("description")
-    if default_desc is not None and not isinstance(default_desc, str):
+    DEFAULT_DESCRIPTION = "From phone number manager"
+    default_desc = event.get("description", DEFAULT_DESCRIPTION)
+    if not isinstance(default_desc, str):
         raise ValueError("'description' must be a string")
 
     normalised = []
