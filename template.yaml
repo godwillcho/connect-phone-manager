@@ -1,0 +1,747 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Amazon Connect Phone Number Manager — Lambda function with S3-backed
+  CSV record storage. Supports search, batch claim, and batch release
+  of US phone numbers.
+
+# ────────────────────────────────────────────────────────────
+# Parameters
+# ────────────────────────────────────────────────────────────
+Parameters:
+  ConnectInstanceArn:
+    Type: String
+    Description: >
+      Amazon Connect instance ARN.
+      e.g. arn:aws:connect:us-east-1:123456789012:instance/aabbccdd-1122-3344-5566-aabbccddeeff
+    AllowedPattern: "arn:aws:connect:[a-z0-9-]+:[0-9]{12}:instance/[a-f0-9-]+"
+    ConstraintDescription: Must be a valid Amazon Connect instance ARN.
+
+  ContactFlowArn:
+    Type: String
+    Description: >
+      Contact flow ARN to associate with claimed phone numbers.
+      e.g. arn:aws:connect:us-east-1:123456789012:instance/.../contact-flow/ffffffff-...
+    AllowedPattern: "arn:aws:connect:[a-z0-9-]+:[0-9]{12}:instance/[a-f0-9-]+/contact-flow/[a-f0-9-]+"
+    ConstraintDescription: Must be a valid Amazon Connect contact flow ARN.
+
+  ConnectRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region of the Amazon Connect instance.
+    AllowedPattern: "[a-z]{2}-[a-z]+-[0-9]+"
+    ConstraintDescription: Must be a valid AWS region (e.g. us-east-1).
+
+  S3BucketName:
+    Type: String
+    Default: ""
+    Description: >
+      Optional explicit bucket name.  Leave blank to auto-generate
+      a name like connect-phone-manager-<account-id>.
+
+  S3Prefix:
+    Type: String
+    Default: connect-phone-manager
+    Description: S3 key prefix for CSV files.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+    Description: Python log level for the Lambda function.
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: >
+      Lambda timeout in seconds.  Batch claims with polling can be
+      slow — 300s covers ~20 numbers comfortably.
+
+  LambdaMemory:
+    Type: Number
+    Default: 256
+    AllowedValues: [128, 256, 512, 1024]
+    Description: Lambda memory in MB.
+
+Conditions:
+  AutoBucketName: !Equals [!Ref S3BucketName, ""]
+
+# ────────────────────────────────────────────────────────────
+# Resources
+# ────────────────────────────────────────────────────────────
+Resources:
+
+  # ── S3 bucket for CSV records ─────────────────────────────
+  PhoneManagerBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName:
+        !If
+          - AutoBucketName
+          - !Sub "connect-phone-manager-${AWS::AccountId}"
+          - !Ref S3BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      Tags:
+        - Key: Application
+          Value: ConnectPhoneManager
+
+  # ── IAM role for the Lambda function ──────────────────────
+  PhoneManagerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ConnectPhoneManagerRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+
+        - PolicyName: ConnectPhoneOps
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:SearchAvailablePhoneNumbers
+                  - connect:ClaimPhoneNumber
+                  - connect:DescribePhoneNumber
+                  - connect:AssociatePhoneNumberContactFlow
+                  - connect:DisassociatePhoneNumberContactFlow
+                  - connect:ReleasePhoneNumber
+                Resource: "*"
+
+        - PolicyName: S3CsvAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${PhoneManagerBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt PhoneManagerBucket.Arn
+
+  # ── Lambda function (all code inlined) ────────────────────
+  PhoneManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ConnectPhoneManager-${AWS::StackName}"
+      Description: Manage Amazon Connect phone numbers (search, claim, release)
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemory
+      Role: !GetAtt PhoneManagerLambdaRole.Arn
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ARN: !Ref ConnectInstanceArn
+          CONTACT_FLOW_ARN: !Ref ContactFlowArn
+          CONNECT_REGION: !Ref ConnectRegion
+          S3_BUCKET: !Ref PhoneManagerBucket
+          S3_PREFIX: !Ref S3Prefix
+          LOG_LEVEL: !Ref LogLevel
+      Tags:
+        - Key: Application
+          Value: ConnectPhoneManager
+      Code:
+        ZipFile: |
+          """
+          Amazon Connect Phone Number Manager — single-file Lambda.
+          Actions: search, claim (batch), release (batch).
+          Config (instance_arn, contact_flow_arn, region) passed per invocation.
+          CSV records stored in S3.
+          """
+          import boto3, csv, io, json, logging, os, random, time, traceback
+          from dataclasses import dataclass
+          from datetime import datetime, timezone
+          from functools import wraps
+          from botocore.exceptions import ClientError
+
+          # ── Logging ────────────────────────────────────────────
+          logger = logging.getLogger("connect_phone_manager")
+          logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+          # ── Constants ──────────────────────────────────────────
+          PHONE_COUNTRY_CODE = "US"
+          SUPPORTED_TYPES = ("DID", "TOLL_FREE")
+          VALID_ACTIONS = ("search", "claim", "release")
+          CLAIM_POLL_INTERVAL = 3.0
+          CLAIM_POLL_MAX_ATTEMPTS = 10
+          DEFAULT_S3_PREFIX = "connect-phone-manager"
+          CLAIMED_CSV_KEY = "claimed_phone_numbers.csv"
+          RELEASED_CSV_KEY = "released_phone_numbers.csv"
+          CLAIMED_CSV_HEADERS = [
+              "timestamp", "phone_number", "number_type", "phone_number_id",
+              "phone_number_arn", "contact_flow_arn", "instance_id",
+              "instance_arn", "status",
+          ]
+          RELEASED_CSV_HEADERS = [
+              "released_at", "phone_number", "number_type", "phone_number_id",
+              "phone_number_arn", "contact_flow_arn", "instance_id",
+              "instance_arn", "claimed_at",
+          ]
+          RETRYABLE_ERROR_CODES = frozenset({
+              "ThrottlingException", "TooManyRequestsException",
+              "RequestLimitExceeded", "ServiceUnavailable",
+              "InternalServiceException",
+          })
+
+          # ── Config dataclass ──────────────────────────────────
+          @dataclass(frozen=True)
+          class ConnectConfig:
+              instance_arn: str
+              instance_id: str
+              contact_flow_arn: str
+              region: str
+              s3_bucket: str
+              s3_prefix: str
+
+          def _extract_instance_id(arn):
+              try:
+                  if "instance/" not in arn:
+                      raise ValueError("ARN does not contain 'instance/'")
+                  iid = arn.split("instance/")[-1].split("/")[0]
+                  if not iid:
+                      raise ValueError("Empty instance ID segment")
+                  return iid
+              except (IndexError, ValueError) as exc:
+                  raise ValueError(
+                      f"Could not extract instance ID from ARN '{arn}': {exc}. "
+                      "Expected: arn:aws:connect:<region>:<account>:instance/<id>"
+                  ) from exc
+
+          def _build_config(event):
+              instance_arn = event.get("instance_arn") or os.environ.get("CONNECT_INSTANCE_ARN", "")
+              contact_flow_arn = event.get("contact_flow_arn") or os.environ.get("CONTACT_FLOW_ARN", "")
+              region = event.get("region") or os.environ.get("CONNECT_REGION", "us-east-1")
+              if not instance_arn:
+                  raise ValueError("'instance_arn' is required (event or CONNECT_INSTANCE_ARN env var)")
+              if not contact_flow_arn:
+                  raise ValueError("'contact_flow_arn' is required (event or CONTACT_FLOW_ARN env var)")
+              s3_bucket = event.get("s3_bucket") or os.environ.get("S3_BUCKET", "")
+              if not s3_bucket:
+                  raise ValueError("'s3_bucket' must be in the event or S3_BUCKET env var")
+              s3_prefix = event.get("s3_prefix") or os.environ.get("S3_PREFIX", DEFAULT_S3_PREFIX)
+              return ConnectConfig(
+                  instance_arn=instance_arn,
+                  instance_id=_extract_instance_id(instance_arn),
+                  contact_flow_arn=contact_flow_arn,
+                  region=region, s3_bucket=s3_bucket, s3_prefix=s3_prefix,
+              )
+
+          # ── Retry decorator ───────────────────────────────────
+          def retry_with_backoff(max_retries=5, base_delay=1.0, max_delay=30.0):
+              def decorator(func):
+                  @wraps(func)
+                  def wrapper(*args, **kwargs):
+                      last_exc = None
+                      for attempt in range(max_retries + 1):
+                          try:
+                              return func(*args, **kwargs)
+                          except ClientError as exc:
+                              code = exc.response["Error"]["Code"]
+                              if code not in RETRYABLE_ERROR_CODES or attempt == max_retries:
+                                  raise
+                              last_exc = exc
+                              delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), max_delay)
+                              logger.warning(
+                                  "Retryable '%s' on %s (attempt %d/%d) — retry in %.1fs",
+                                  code, func.__name__, attempt + 1, max_retries, delay,
+                              )
+                              time.sleep(delay)
+                      raise last_exc
+                  return wrapper
+              return decorator
+
+          # ── Validation ────────────────────────────────────────
+          def _validate_event(event):
+              if not isinstance(event, dict):
+                  raise ValueError("Event must be a JSON object")
+              action = event.get("action", "")
+              if action not in VALID_ACTIONS:
+                  raise ValueError(f"'action' must be one of {VALID_ACTIONS}, got '{action}'")
+              # instance_arn and contact_flow_arn are optional in the event
+              # because they can come from env vars set via CloudFormation parameters.
+              # _build_config() resolves event -> env var fallback.
+              for field in ("instance_arn", "contact_flow_arn", "region"):
+                  val = event.get(field)
+                  if val is not None and (not isinstance(val, str) or not val.strip()):
+                      raise ValueError(f"'{field}' must be a non-empty string when provided")
+              if action == "search":
+                  nt = event.get("number_type", "DID")
+                  if nt not in SUPPORTED_TYPES:
+                      raise ValueError(f"'number_type' must be one of {SUPPORTED_TYPES}")
+                  event.setdefault("number_type", nt)
+                  prefix = event.get("prefix")
+                  if prefix is not None:
+                      if not isinstance(prefix, str) or not prefix.startswith("+"):
+                          raise ValueError("'prefix' must start with '+' (e.g. '+1972')")
+                  # No prefix = any available US number
+                  mr = event.get("max_results", 10)
+                  if not isinstance(mr, int) or mr < 1 or mr > 100:
+                      raise ValueError("'max_results' must be 1-100")
+                  event["max_results"] = mr
+              elif action == "claim":
+                  nt = event.get("number_type", "")
+                  if nt not in SUPPORTED_TYPES:
+                      raise ValueError(f"'number_type' must be one of {SUPPORTED_TYPES}")
+                  pns = event.get("phone_numbers")
+                  if not isinstance(pns, list) or len(pns) == 0:
+                      raise ValueError("'phone_numbers' must be a non-empty list")
+                  for i, pn in enumerate(pns):
+                      if not isinstance(pn, str) or not pn.startswith("+"):
+                          raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
+              elif action == "release":
+                  pids = event.get("phone_number_ids")
+                  if not isinstance(pids, list) or len(pids) == 0:
+                      raise ValueError("'phone_number_ids' must be a non-empty list")
+                  for i, pid in enumerate(pids):
+                      if not isinstance(pid, str) or not pid.strip():
+                          raise ValueError(f"phone_number_ids[{i}] must be a non-empty string")
+              return event
+
+          # ── S3 CSV helpers ────────────────────────────────────
+          def _s3_key(config, filename):
+              return f"{config.s3_prefix}/{filename}"
+
+          def _read_csv(s3c, bucket, key):
+              try:
+                  resp = s3c.get_object(Bucket=bucket, Key=key)
+                  body = resp["Body"].read().decode("utf-8")
+                  return list(csv.DictReader(io.StringIO(body)))
+              except ClientError as exc:
+                  if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+                      logger.info("CSV not found at s3://%s/%s — starting fresh", bucket, key)
+                      return []
+                  raise
+
+          def _write_csv(s3c, bucket, key, headers, rows):
+              buf = io.StringIO()
+              w = csv.DictWriter(buf, fieldnames=headers)
+              w.writeheader()
+              w.writerows(rows)
+              s3c.put_object(Bucket=bucket, Key=key, Body=buf.getvalue().encode("utf-8"), ContentType="text/csv")
+              logger.info("Wrote %d row(s) to s3://%s/%s", len(rows), bucket, key)
+
+          def _append_claimed(s3c, cfg, record):
+              key = _s3_key(cfg, CLAIMED_CSV_KEY)
+              rows = _read_csv(s3c, cfg.s3_bucket, key)
+              rows.append(record)
+              _write_csv(s3c, cfg.s3_bucket, key, CLAIMED_CSV_HEADERS, rows)
+
+          def _update_claimed_status(s3c, cfg, pn_id, new_status):
+              key = _s3_key(cfg, CLAIMED_CSV_KEY)
+              rows = _read_csv(s3c, cfg.s3_bucket, key)
+              updated = False
+              for row in rows:
+                  if row["phone_number_id"] == pn_id:
+                      row["status"] = new_status
+                      updated = True
+              if updated:
+                  _write_csv(s3c, cfg.s3_bucket, key, CLAIMED_CSV_HEADERS, rows)
+                  logger.info("Status for %s updated to '%s'", pn_id, new_status)
+              else:
+                  logger.warning("phone_number_id '%s' not found in claimed CSV", pn_id)
+              return updated
+
+          def _get_claimed_row(s3c, cfg, pn_id):
+              key = _s3_key(cfg, CLAIMED_CSV_KEY)
+              for row in _read_csv(s3c, cfg.s3_bucket, key):
+                  if row["phone_number_id"] == pn_id:
+                      return row
+              return None
+
+          def _append_released(s3c, cfg, record):
+              key = _s3_key(cfg, RELEASED_CSV_KEY)
+              rows = _read_csv(s3c, cfg.s3_bucket, key)
+              rows.append(record)
+              _write_csv(s3c, cfg.s3_bucket, key, RELEASED_CSV_HEADERS, rows)
+
+          # ── Connect API wrappers (with retry) ─────────────────
+          def _now_utc():
+              return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+          @retry_with_backoff()
+          def _search_page(client, kwargs):
+              return client.search_available_phone_numbers(**kwargs)
+
+          def search_available_numbers(client, config, number_type, prefix=None, max_results=10):
+              collected = []
+              next_token = None
+              while len(collected) < max_results:
+                  page_size = min(10, max_results - len(collected))
+                  kw = {
+                      "TargetArn": config.instance_arn,
+                      "PhoneNumberCountryCode": PHONE_COUNTRY_CODE,
+                      "PhoneNumberType": number_type,
+                      "MaxResults": page_size,
+                  }
+                  if prefix:
+                      kw["PhoneNumberPrefix"] = prefix
+                  if next_token:
+                      kw["NextToken"] = next_token
+                  try:
+                      resp = _search_page(client, kw)
+                  except ClientError as exc:
+                      code = exc.response["Error"]["Code"]
+                      if code in ("InvalidParameterException", "ResourceNotFoundException"):
+                          logger.warning("Search failed for '%s': %s", number_type, exc.response["Error"]["Message"])
+                          break
+                      raise
+                  page = resp.get("AvailableNumbersList", [])
+                  collected.extend(page)
+                  next_token = resp.get("NextToken")
+                  if not next_token or not page:
+                      break
+              logger.info("Search returned %d available number(s)", len(collected))
+              return collected[:max_results]
+
+          @retry_with_backoff()
+          def _claim_api(client, instance_arn, phone_number):
+              return client.claim_phone_number(TargetArn=instance_arn, PhoneNumber=phone_number)
+
+          def claim_phone_number(client, config, phone_number):
+              logger.info("Claiming %s on instance %s", phone_number, config.instance_id)
+              return _claim_api(client, config.instance_arn, phone_number)
+
+          @retry_with_backoff(max_retries=2)
+          def _describe_api(client, pn_id):
+              return client.describe_phone_number(PhoneNumberId=pn_id)
+
+          def poll_claim_status(client, pn_id):
+              for attempt in range(1, CLAIM_POLL_MAX_ATTEMPTS + 1):
+                  try:
+                      resp = _describe_api(client, pn_id)
+                      status = resp.get("ClaimedPhoneNumberSummary", {}).get("PhoneNumberStatus", {}).get("Status", "UNKNOWN")
+                  except ClientError as exc:
+                      logger.error("describe_phone_number error: %s", exc)
+                      return "UNKNOWN"
+                  if status != "IN_PROGRESS":
+                      return status
+                  logger.info("Claim IN_PROGRESS — poll %d/%d, retrying in %.0fs", attempt, CLAIM_POLL_MAX_ATTEMPTS, CLAIM_POLL_INTERVAL)
+                  time.sleep(CLAIM_POLL_INTERVAL)
+              logger.warning("Timed out waiting for claim after %d attempts", CLAIM_POLL_MAX_ATTEMPTS)
+              return "UNKNOWN"
+
+          @retry_with_backoff()
+          def associate_phone_to_flow(client, config, pn_id):
+              client.associate_phone_number_contact_flow(PhoneNumberId=pn_id, InstanceId=config.instance_id, ContactFlowId=config.contact_flow_arn)
+              logger.info("Associated %s with flow %s", pn_id, config.contact_flow_arn)
+
+          @retry_with_backoff()
+          def disassociate_phone_from_flow(client, config, pn_id):
+              client.disassociate_phone_number_contact_flow(PhoneNumberId=pn_id, InstanceId=config.instance_id)
+              logger.info("Disassociated %s", pn_id)
+
+          @retry_with_backoff()
+          def release_phone_number(client, pn_id):
+              client.release_phone_number(PhoneNumberId=pn_id)
+              logger.info("Released %s", pn_id)
+
+          # ── Batch claim ───────────────────────────────────────
+          def batch_claim(client, s3c, config, phone_numbers, number_type):
+              results = []
+              for pn in phone_numbers:
+                  result = {"phone_number": pn, "phone_number_id": None, "phone_number_arn": None, "status": "failed", "error": None}
+                  try:
+                      resp = claim_phone_number(client, config, pn)
+                  except ClientError as exc:
+                      result["error"] = str(exc)
+                      logger.error("Claim failed for %s: %s", pn, exc)
+                      results.append(result)
+                      continue
+                  pn_id = resp["PhoneNumberId"]
+                  pn_arn = resp["PhoneNumberArn"]
+                  result["phone_number_id"] = pn_id
+                  result["phone_number_arn"] = pn_arn
+                  claimed_at = _now_utc()
+                  cs = poll_claim_status(client, pn_id)
+                  if cs == "FAILED":
+                      result["error"] = "Claim FAILED — auto-release within 24h"
+                      logger.error("Claim FAILED for %s", pn)
+                      results.append(result)
+                      continue
+                  if cs == "UNKNOWN":
+                      logger.warning("Could not confirm claim for %s — attempting association", pn)
+                  status = "claimed"
+                  try:
+                      associate_phone_to_flow(client, config, pn_id)
+                  except ClientError as exc:
+                      status = "association_failed"
+                      result["error"] = f"Association failed: {exc}"
+                      logger.warning("Association failed for %s: %s", pn, exc)
+                  result["status"] = status
+                  _append_claimed(s3c, config, {
+                      "timestamp": claimed_at, "phone_number": pn,
+                      "number_type": number_type, "phone_number_id": pn_id,
+                      "phone_number_arn": pn_arn, "contact_flow_arn": config.contact_flow_arn,
+                      "instance_id": config.instance_id, "instance_arn": config.instance_arn,
+                      "status": status,
+                  })
+                  results.append(result)
+              return results
+
+          # ── Batch release ─────────────────────────────────────
+          def batch_release(client, s3c, config, phone_number_ids):
+              results = []
+              for pn_id in phone_number_ids:
+                  row = _get_claimed_row(s3c, config, pn_id)
+                  result = {"phone_number_id": pn_id, "phone_number": row["phone_number"] if row else "", "status": "release_failed", "error": None}
+                  try:
+                      disassociate_phone_from_flow(client, config, pn_id)
+                  except ClientError as exc:
+                      code = exc.response["Error"]["Code"]
+                      if code in ("ResourceNotFoundException", "InvalidParameterException"):
+                          logger.info("Disassociate skipped for %s: %s", pn_id, exc.response["Error"]["Message"])
+                      else:
+                          logger.warning("Disassociate failed (non-fatal) for %s: %s", pn_id, exc)
+                  try:
+                      release_phone_number(client, pn_id)
+                  except ClientError as exc:
+                      result["error"] = str(exc)
+                      logger.error("Release failed for %s: %s", pn_id, exc)
+                      _update_claimed_status(s3c, config, pn_id, "release_failed")
+                      results.append(result)
+                      continue
+                  result["status"] = "released"
+                  _update_claimed_status(s3c, config, pn_id, "released")
+                  if row:
+                      _append_released(s3c, config, {
+                          "released_at": _now_utc(), "phone_number": row.get("phone_number", ""),
+                          "number_type": row.get("number_type", ""), "phone_number_id": pn_id,
+                          "phone_number_arn": row.get("phone_number_arn", ""),
+                          "contact_flow_arn": row.get("contact_flow_arn", ""),
+                          "instance_id": row.get("instance_id", ""),
+                          "instance_arn": row.get("instance_arn", ""),
+                          "claimed_at": row.get("timestamp", ""),
+                      })
+                  results.append(result)
+              return results
+
+          # ── Lambda handler ────────────────────────────────────
+          def _response(status_code, body):
+              return {"statusCode": status_code, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body, default=str)}
+
+          def lambda_handler(event, context):
+              request_id = getattr(context, "aws_request_id", "local")
+              logger.info("Invocation %s — action=%s", request_id, event.get("action"))
+              try:
+                  event = _validate_event(event)
+              except ValueError as exc:
+                  logger.warning("Validation error: %s", exc)
+                  return _response(400, {"error": str(exc)})
+              try:
+                  config = _build_config(event)
+              except ValueError as exc:
+                  logger.warning("Config error: %s", exc)
+                  return _response(400, {"error": str(exc)})
+              cc = boto3.client("connect", region_name=config.region)
+              s3c = boto3.client("s3", region_name=config.region)
+              action = event["action"]
+              try:
+                  if action == "search":
+                      nums = search_available_numbers(cc, config, event.get("number_type", "DID"), event.get("prefix"), event.get("max_results", 10))
+                      return _response(200, {"available_numbers": nums, "count": len(nums)})
+                  elif action == "claim":
+                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
+                      ok = sum(1 for r in res if r["status"] == "claimed")
+                      return _response(200, {"results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
+                  elif action == "release":
+                      res = batch_release(cc, s3c, config, event["phone_number_ids"])
+                      ok = sum(1 for r in res if r["status"] == "released")
+                      return _response(200, {"results": res, "summary": {"released": ok, "failed": len(res) - ok}})
+              except Exception:
+                  logger.error("Unhandled exception:\n%s", traceback.format_exc())
+                  return _response(500, {"error": "Internal server error", "request_id": request_id})
+
+  # ── Lambda test invocation (runs on stack create/update) ──
+  PhoneManagerTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ConnectPhoneManagerTestRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TestLambdaPerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt PhoneManagerFunction.Arn
+
+  PhoneManagerTestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ConnectPhoneManagerTest-${AWS::StackName}"
+      Description: Tests the PhoneManager Lambda with search, claim, and release events
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt PhoneManagerTestRole.Arn
+      Environment:
+        Variables:
+          TARGET_FUNCTION: !Ref PhoneManagerFunction
+      Code:
+        ZipFile: |
+          import boto3, json, os, logging
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              client = boto3.client("lambda")
+              fn = os.environ["TARGET_FUNCTION"]
+              test_cases = {
+                  "search_valid": {
+                      "action": "search",
+                      "number_type": "DID",
+                      "max_results": 1,
+                  },
+                  "search_toll_free": {
+                      "action": "search",
+                      "number_type": "TOLL_FREE",
+                      "max_results": 1,
+                  },
+                  "missing_action": {},
+                  "bad_action": {"action": "invalid"},
+                  "claim_missing_numbers": {
+                      "action": "claim",
+                      "number_type": "DID",
+                  },
+                  "release_missing_ids": {
+                      "action": "release",
+                  },
+              }
+
+              results = {}
+              all_passed = True
+
+              for name, payload in test_cases.items():
+                  logger.info("Running test: %s", name)
+                  resp = client.invoke(
+                      FunctionName=fn,
+                      InvocationType="RequestResponse",
+                      Payload=json.dumps(payload).encode(),
+                  )
+                  result = json.loads(resp["Payload"].read().decode())
+                  status = result.get("statusCode", 0)
+                  body = json.loads(result.get("body", "{}")) if isinstance(result.get("body"), str) else result.get("body", {})
+
+                  if name.startswith("search_"):
+                      passed = status == 200
+                  elif name in ("missing_action", "bad_action", "claim_missing_numbers", "release_missing_ids"):
+                      passed = status == 400
+                  else:
+                      passed = True
+
+                  results[name] = {"statusCode": status, "passed": passed}
+                  if not passed:
+                      all_passed = False
+                      logger.error("FAIL %s: expected valid response, got %s — %s", name, status, json.dumps(body))
+                  else:
+                      logger.info("PASS %s: statusCode=%d", name, status)
+
+              passed_count = sum(1 for r in results.values() if r["passed"])
+              total = len(results)
+              summary = f"{passed_count}/{total} tests passed"
+              logger.info("Test summary: %s", summary)
+
+              response_data = {"Summary": summary, "AllPassed": str(all_passed)}
+              if all_passed:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              else:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data, reason=f"Tests failed: {summary}")
+
+  PhoneManagerTestInvocation:
+    Type: Custom::LambdaTest
+    DependsOn:
+      - PhoneManagerFunction
+      - PhoneManagerLogGroup
+    Properties:
+      ServiceToken: !GetAtt PhoneManagerTestFunction.Arn
+      # Change this value to re-run tests on stack update
+      TestRunId: !Sub "${AWS::StackName}-v1"
+
+  PhoneManagerTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PhoneManagerTestFunction}"
+      RetentionInDays: 7
+
+  # ── CloudWatch Log Group (explicit, for retention control) ─
+  PhoneManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${PhoneManagerFunction}"
+      RetentionInDays: 30
+
+# ────────────────────────────────────────────────────────────
+# Outputs
+# ────────────────────────────────────────────────────────────
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the Phone Manager Lambda function
+    Value: !GetAtt PhoneManagerFunction.Arn
+
+  LambdaFunctionName:
+    Description: Name of the Phone Manager Lambda function
+    Value: !Ref PhoneManagerFunction
+
+  S3BucketNameOutput:
+    Description: S3 bucket used for CSV records
+    Value: !Ref PhoneManagerBucket
+
+  IAMRoleArn:
+    Description: IAM role used by the Lambda function
+    Value: !GetAtt PhoneManagerLambdaRole.Arn
+
+  TestSummary:
+    Description: Result of the automated Lambda test invocation
+    Value: !GetAtt PhoneManagerTestInvocation.Summary
+
+  TestAllPassed:
+    Description: Whether all Lambda tests passed
+    Value: !GetAtt PhoneManagerTestInvocation.AllPassed
