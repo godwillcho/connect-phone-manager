@@ -51,12 +51,12 @@ Parameters:
 
   LambdaTimeout:
     Type: Number
-    Default: 300
+    Default: 900
     MinValue: 30
     MaxValue: 900
     Description: >
-      Lambda timeout in seconds.  Batch claims with polling can be
-      slow — 300s covers ~20 numbers comfortably.
+      Lambda timeout in seconds.  Auto-claim monitors remaining time
+      and stops safely.  900s (max) covers ~50-60 numbers per invocation.
 
   LambdaMemory:
     Type: Number
@@ -325,32 +325,43 @@ Resources:
                   nt = event.get("number_type", "")
                   if nt not in SUPPORTED_TYPES:
                       raise ValueError(f"'number_type' must be one of {SUPPORTED_TYPES}")
-                  pns = event.get("phone_numbers")
-                  if not isinstance(pns, list) or len(pns) == 0:
-                      raise ValueError("'phone_numbers' must be a non-empty list")
-                  # Normalise phone_numbers to list of {"number": str, "description": str}
-                  # Accepts: "+1555..." OR {"number": "+1555...", "description": "..."}
                   DEFAULT_DESCRIPTION = "From phone number manager"
                   default_desc = event.get("description", DEFAULT_DESCRIPTION)
                   if not isinstance(default_desc, str):
                       raise ValueError("'description' must be a string")
-                  normalised = []
-                  for i, pn in enumerate(pns):
-                      if isinstance(pn, str):
-                          if not pn.startswith("+"):
-                              raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
-                          normalised.append({"number": pn, "description": default_desc})
-                      elif isinstance(pn, dict):
-                          num = pn.get("number", "")
-                          if not isinstance(num, str) or not num.startswith("+"):
-                              raise ValueError(f"phone_numbers[{i}].number must be E.164 (start with '+')")
-                          desc = pn.get("description", default_desc)
-                          if desc is not None and not isinstance(desc, str):
-                              raise ValueError(f"phone_numbers[{i}].description must be a string")
-                          normalised.append({"number": num, "description": desc})
-                      else:
-                          raise ValueError(f"phone_numbers[{i}] must be a string or object with 'number' and optional 'description'")
-                  event["phone_numbers"] = normalised
+                  # Mode 1: count — auto-search and claim N numbers
+                  count = event.get("count")
+                  pns = event.get("phone_numbers")
+                  if count is not None and pns is not None:
+                      raise ValueError("Provide 'count' or 'phone_numbers', not both")
+                  if count is not None:
+                      if not isinstance(count, int) or count < 1 or count > 500:
+                          raise ValueError("'count' must be an integer between 1 and 500")
+                      event["count"] = count
+                      event.setdefault("description", default_desc)
+                  elif pns is not None:
+                      # Mode 2: explicit phone_numbers list
+                      if not isinstance(pns, list) or len(pns) == 0:
+                          raise ValueError("'phone_numbers' must be a non-empty list")
+                      normalised = []
+                      for i, pn in enumerate(pns):
+                          if isinstance(pn, str):
+                              if not pn.startswith("+"):
+                                  raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
+                              normalised.append({"number": pn, "description": default_desc})
+                          elif isinstance(pn, dict):
+                              num = pn.get("number", "")
+                              if not isinstance(num, str) or not num.startswith("+"):
+                                  raise ValueError(f"phone_numbers[{i}].number must be E.164 (start with '+')")
+                              desc = pn.get("description", default_desc)
+                              if desc is not None and not isinstance(desc, str):
+                                  raise ValueError(f"phone_numbers[{i}].description must be a string")
+                              normalised.append({"number": num, "description": desc})
+                          else:
+                              raise ValueError(f"phone_numbers[{i}] must be a string or object with 'number' and optional 'description'")
+                      event["phone_numbers"] = normalised
+                  else:
+                      raise ValueError("Provide 'count' (auto-search) or 'phone_numbers' (explicit list)")
               elif action == "release":
                   pids = event.get("phone_number_ids")
                   if not isinstance(pids, list) or len(pids) == 0:
@@ -546,6 +557,93 @@ Resources:
                   results.append(result)
               return results
 
+          # ── Auto claim (search + claim by count) ──────────────
+          def auto_claim(client, s3c, config, count, number_type, description, context=None):
+              results = []
+              claimed_count = 0
+              failed_count = 0
+              search_offset = 0
+              TIME_BUFFER_MS = 30000  # stop 30s before timeout
+
+              while claimed_count < count:
+                  # Check remaining Lambda time
+                  if context and hasattr(context, "get_remaining_time_in_millis"):
+                      remaining = context.get_remaining_time_in_millis()
+                      if remaining < TIME_BUFFER_MS:
+                          logger.warning("Stopping early — only %dms remaining (need %dms buffer)", remaining, TIME_BUFFER_MS)
+                          break
+
+                  # Search for a batch of available numbers
+                  needed = count - claimed_count
+                  search_batch = min(10, needed + 5)  # grab extras in case some fail
+                  candidates = search_available_numbers(client, config, number_type, max_results=search_batch)
+                  if not candidates:
+                      logger.warning("No more available numbers found — stopping at %d/%d", claimed_count, count)
+                      break
+
+                  for candidate in candidates:
+                      if claimed_count >= count:
+                          break
+                      if context and hasattr(context, "get_remaining_time_in_millis"):
+                          if context.get_remaining_time_in_millis() < TIME_BUFFER_MS:
+                              logger.warning("Stopping early — timeout approaching")
+                              break
+
+                      pn = candidate["PhoneNumber"]
+                      result = {"phone_number": pn, "phone_number_id": None, "phone_number_arn": None, "description": description, "status": "failed", "error": None}
+
+                      # Claim
+                      try:
+                          resp = claim_phone_number(client, config, pn, description)
+                      except ClientError as exc:
+                          result["error"] = str(exc)
+                          logger.warning("Claim failed for %s: %s", pn, exc)
+                          failed_count += 1
+                          results.append(result)
+                          continue
+
+                      pn_id = resp["PhoneNumberId"]
+                      pn_arn = resp["PhoneNumberArn"]
+                      result["phone_number_id"] = pn_id
+                      result["phone_number_arn"] = pn_arn
+                      claimed_at = _now_utc()
+
+                      # Poll
+                      cs = poll_claim_status(client, pn_id)
+                      if cs == "FAILED":
+                          result["error"] = "Claim FAILED — auto-release within 24h"
+                          logger.error("Claim FAILED for %s", pn)
+                          failed_count += 1
+                          results.append(result)
+                          continue
+
+                      # Associate
+                      status = "claimed"
+                      try:
+                          associate_phone_to_flow(client, config, pn_id)
+                      except ClientError as exc:
+                          status = "association_failed"
+                          result["error"] = f"Association failed: {exc}"
+                          logger.warning("Association failed for %s: %s", pn, exc)
+
+                      result["status"] = status
+                      _append_claimed(s3c, config, {
+                          "timestamp": claimed_at, "phone_number": pn,
+                          "number_type": number_type, "phone_number_id": pn_id,
+                          "phone_number_arn": pn_arn, "contact_flow_arn": config.contact_flow_arn,
+                          "instance_id": config.instance_id, "instance_arn": config.instance_arn,
+                          "description": description, "status": status,
+                      })
+                      results.append(result)
+                      if status == "claimed":
+                          claimed_count += 1
+                      else:
+                          failed_count += 1
+
+                      logger.info("Progress: %d/%d claimed", claimed_count, count)
+
+              return results, claimed_count, count - claimed_count
+
           # ── Batch release ─────────────────────────────────────
           def batch_release(client, s3c, config, phone_number_ids):
               results = []
@@ -608,9 +706,13 @@ Resources:
                       nums = search_available_numbers(cc, config, event.get("number_type", "DID"), event.get("prefix"), event.get("max_results", 10))
                       return _response(200, {"available_numbers": nums, "count": len(nums)})
                   elif action == "claim":
-                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
-                      ok = sum(1 for r in res if r["status"] == "claimed")
-                      return _response(200, {"run_id": config.run_id, "results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
+                      if "count" in event:
+                          res, claimed, remaining = auto_claim(cc, s3c, config, event["count"], event["number_type"], event.get("description", "From phone number manager"), context)
+                          return _response(200, {"run_id": config.run_id, "results": res, "summary": {"requested": event["count"], "claimed": claimed, "remaining": remaining, "failed": len(res) - claimed}})
+                      else:
+                          res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
+                          ok = sum(1 for r in res if r["status"] == "claimed")
+                          return _response(200, {"run_id": config.run_id, "results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
                   elif action == "release":
                       res = batch_release(cc, s3c, config, event["phone_number_ids"])
                       ok = sum(1 for r in res if r["status"] == "released")

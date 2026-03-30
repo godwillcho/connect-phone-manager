@@ -69,40 +69,53 @@ def _validate_claim(event: dict) -> None:
             f"'number_type' must be one of {SUPPORTED_TYPES}, got '{number_type}'"
         )
 
-    phone_numbers = event.get("phone_numbers")
-    if not isinstance(phone_numbers, list) or len(phone_numbers) == 0:
-        raise ValueError("'phone_numbers' must be a non-empty list of E.164 phone numbers")
-
-    # Normalise phone_numbers to list of {"number": str, "description": str}
-    # Accepts: "+1555..." OR {"number": "+1555...", "description": "..."}
     DEFAULT_DESCRIPTION = "From phone number manager"
     default_desc = event.get("description", DEFAULT_DESCRIPTION)
     if not isinstance(default_desc, str):
         raise ValueError("'description' must be a string")
 
-    normalised = []
-    for idx, pn in enumerate(phone_numbers):
-        if isinstance(pn, str):
-            if not pn.startswith("+"):
+    count = event.get("count")
+    phone_numbers = event.get("phone_numbers")
+
+    if count is not None and phone_numbers is not None:
+        raise ValueError("Provide 'count' or 'phone_numbers', not both")
+
+    if count is not None:
+        # Mode 1: auto-search and claim N numbers
+        if not isinstance(count, int) or count < 1 or count > 500:
+            raise ValueError("'count' must be an integer between 1 and 500")
+        event["count"] = count
+        event.setdefault("description", default_desc)
+    elif phone_numbers is not None:
+        # Mode 2: explicit phone_numbers list
+        if not isinstance(phone_numbers, list) or len(phone_numbers) == 0:
+            raise ValueError("'phone_numbers' must be a non-empty list of E.164 phone numbers")
+
+        normalised = []
+        for idx, pn in enumerate(phone_numbers):
+            if isinstance(pn, str):
+                if not pn.startswith("+"):
+                    raise ValueError(
+                        f"phone_numbers[{idx}] must be E.164 (start with '+'), got '{pn}'"
+                    )
+                normalised.append({"number": pn, "description": default_desc})
+            elif isinstance(pn, dict):
+                num = pn.get("number", "")
+                if not isinstance(num, str) or not num.startswith("+"):
+                    raise ValueError(
+                        f"phone_numbers[{idx}].number must be E.164 (start with '+')"
+                    )
+                desc = pn.get("description", default_desc)
+                if desc is not None and not isinstance(desc, str):
+                    raise ValueError(f"phone_numbers[{idx}].description must be a string")
+                normalised.append({"number": num, "description": desc})
+            else:
                 raise ValueError(
-                    f"phone_numbers[{idx}] must be E.164 (start with '+'), got '{pn}'"
+                    f"phone_numbers[{idx}] must be a string or object with 'number' and optional 'description'"
                 )
-            normalised.append({"number": pn, "description": default_desc})
-        elif isinstance(pn, dict):
-            num = pn.get("number", "")
-            if not isinstance(num, str) or not num.startswith("+"):
-                raise ValueError(
-                    f"phone_numbers[{idx}].number must be E.164 (start with '+')"
-                )
-            desc = pn.get("description", default_desc)
-            if desc is not None and not isinstance(desc, str):
-                raise ValueError(f"phone_numbers[{idx}].description must be a string")
-            normalised.append({"number": num, "description": desc})
-        else:
-            raise ValueError(
-                f"phone_numbers[{idx}] must be a string or object with 'number' and optional 'description'"
-            )
-    event["phone_numbers"] = normalised
+        event["phone_numbers"] = normalised
+    else:
+        raise ValueError("Provide 'count' (auto-search) or 'phone_numbers' (explicit list)")
 
 
 def _validate_release(event: dict) -> None:
