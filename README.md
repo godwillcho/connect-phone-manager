@@ -96,7 +96,7 @@ Expected outputs include `TestSummary: 6/6 tests passed` and `TestAllPassed: Tru
 | `S3BucketName` | No | `connect-phone-manager-<account-id>` | Override S3 bucket name |
 | `S3Prefix` | No | `connect-phone-manager` | S3 key prefix for CSV files |
 | `LogLevel` | No | `INFO` | Lambda log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
-| `LambdaTimeout` | No | `300` | Lambda timeout in seconds (30-900) |
+| `LambdaTimeout` | No | `900` | Lambda timeout in seconds (30-900). Max recommended for auto-claim. |
 | `LambdaMemory` | No | `256` | Lambda memory in MB (128, 256, 512, 1024) |
 | `CsvRetentionDays` | No | `365` | Days to retain CSV files in S3 before auto-deletion (1-3650) |
 
@@ -152,24 +152,11 @@ aws lambda invoke \
 
 ### Claim (purchase) phone numbers
 
-Supports batch claiming -- pass one or more numbers from the search results. Every claimed number gets a description visible in the Amazon Connect console.
+Two modes: **auto-claim by count** (just say how many) or **explicit phone numbers** (pick specific numbers from search results). Every claimed number gets a description visible in the Amazon Connect console.
 
-**Simple claim (default description: "From phone number manager"):**
+#### Auto-claim by count (recommended)
 
-```bash
-aws lambda invoke \
-  --function-name ConnectPhoneManager-connect-phone-manager \
-  --region us-east-1 \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "action": "claim",
-    "number_type": "DID",
-    "phone_numbers": ["+18625551234", "+18625555678"]
-  }' \
-  output.json
-```
-
-**Shared description for all numbers in the batch:**
+Just specify the type and how many. The Lambda searches for available numbers and claims them automatically:
 
 ```bash
 aws lambda invoke \
@@ -179,33 +166,16 @@ aws lambda invoke \
   --payload '{
     "action": "claim",
     "number_type": "DID",
-    "description": "Customer support lines",
-    "phone_numbers": ["+18625551234", "+18625555678"]
+    "count": 95
   }' \
   output.json
 ```
 
-**Per-number descriptions (can mix with shared):**
-
-```bash
-aws lambda invoke \
-  --function-name ConnectPhoneManager-connect-phone-manager \
-  --region us-east-1 \
-  --cli-binary-format raw-in-base64-out \
-  --payload '{
-    "action": "claim",
-    "number_type": "DID",
-    "description": "General support",
-    "phone_numbers": [
-      "+18625551234",
-      {"number": "+18625555678", "description": "Sales hotline"},
-      {"number": "+18625559999", "description": "Billing dept"}
-    ]
-  }' \
-  output.json
-```
-
-In the example above, the first number gets `"General support"` (the shared fallback), while the other two get their own custom descriptions. Each description appears in the Amazon Connect console under the phone number's details.
+The Lambda will:
+1. Search for available numbers in batches
+2. Claim each one, poll for confirmation, associate with the contact flow
+3. Monitor its remaining execution time and stop safely 30s before timeout
+4. Record each claimed number to the S3 CSV as it goes
 
 **Response:**
 ```json
@@ -213,20 +183,81 @@ In the example above, the first number gets `"General support"` (the shared fall
   "statusCode": 200,
   "body": {
     "run_id": "20260330-143022",
-    "results": [
-      {
-        "phone_number": "+18625551234",
-        "phone_number_id": "a8a98137-538f-48a3-a97a-fcc74a3f5f59",
-        "phone_number_arn": "arn:aws:connect:us-east-1:...:phone-number/a8a98137-...",
-        "description": "General support",
-        "status": "claimed",
-        "error": null
-      }
-    ],
-    "summary": {"claimed": 1, "failed": 0}
+    "results": [...],
+    "summary": {
+      "requested": 95,
+      "claimed": 52,
+      "remaining": 43,
+      "failed": 0
+    }
   }
 }
 ```
+
+If `remaining > 0` (the Lambda ran out of time), re-invoke with the same `run_id` to continue:
+
+```bash
+aws lambda invoke \
+  --function-name ConnectPhoneManager-connect-phone-manager \
+  --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "action": "claim",
+    "number_type": "DID",
+    "count": 43,
+    "run_id": "20260330-143022"
+  }' \
+  output.json
+```
+
+With the default 900s timeout, each invocation handles ~50-60 numbers. All results append to the same CSV when using the same `run_id`.
+
+#### Explicit phone numbers
+
+Pick specific numbers from search results:
+
+```bash
+aws lambda invoke \
+  --function-name ConnectPhoneManager-connect-phone-manager \
+  --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "action": "claim",
+    "number_type": "DID",
+    "phone_numbers": ["+18625551234", "+18625555678"]
+  }' \
+  output.json
+```
+
+#### Descriptions
+
+Every claimed number gets a description (default: `"From phone number manager"`). You can customize it:
+
+**Shared description for all numbers:**
+```json
+{
+  "action": "claim",
+  "number_type": "DID",
+  "count": 10,
+  "description": "Customer support lines"
+}
+```
+
+**Per-number descriptions (explicit mode only, can mix with shared):**
+```json
+{
+  "action": "claim",
+  "number_type": "DID",
+  "description": "General support",
+  "phone_numbers": [
+    "+18625551234",
+    {"number": "+18625555678", "description": "Sales hotline"},
+    {"number": "+18625559999", "description": "Billing dept"}
+  ]
+}
+```
+
+The first number gets `"General support"` (the shared fallback), while the other two get their own custom descriptions. Each description appears in the Amazon Connect console under the phone number's details.
 
 The `run_id` in the response identifies the S3 folder where CSV records are stored. Pass the same `run_id` when releasing these numbers so the release updates the correct CSV files.
 
@@ -306,12 +337,17 @@ All actions accept these optional fields (default to CloudFormation parameter va
 
 ### Claim
 
+Provide **either** `count` (auto-search) **or** `phone_numbers` (explicit list), not both.
+
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `action` | string | Yes | - | `"claim"` |
 | `number_type` | string | Yes | - | `"DID"` or `"TOLL_FREE"` |
-| `phone_numbers` | array | Yes | - | E.164 strings or objects (see below) |
-| `description` | string | No | `"From phone number manager"` | Shared description for all numbers |
+| `count` | integer | * | - | Number of phone numbers to auto-claim (1-500) |
+| `phone_numbers` | array | * | - | Explicit E.164 strings or objects (see below) |
+| `description` | string | No | `"From phone number manager"` | Description for claimed numbers |
+
+\* Provide `count` or `phone_numbers`, not both.
 
 **`phone_numbers` accepts two formats, which can be mixed:**
 
@@ -379,7 +415,9 @@ Records are stored at `<S3Prefix>/<run_id>/` and automatically deleted after `Cs
 
 ## Reliability Features
 
-- **Retry with exponential backoff** -- All Connect API calls automatically retry on `ThrottlingException`, `TooManyRequestsException`, `RequestLimitExceeded`, `ServiceUnavailable`, and `InternalServiceException` (up to 5 retries with jitter)
+- **Auto-claim by count** -- Specify how many numbers you need; the Lambda searches, claims, polls, and associates automatically in a loop
+- **Timeout-aware** -- Auto-claim monitors remaining Lambda execution time and stops safely 30s before timeout, returning partial results with a `remaining` count so you can re-invoke
+- **Retry with exponential backoff** -- All Connect API calls (search, claim, describe, associate, disassociate, release) automatically retry on `ThrottlingException`, `TooManyRequestsException`, `RequestLimitExceeded`, `ServiceUnavailable`, and `InternalServiceException` (up to 5 retries with jitter)
 - **Pagination** -- Phone number search follows `NextToken` across pages to return up to 100 results
 - **Batch operations** -- Claim and release support multiple numbers per invocation with per-number error isolation (one failure does not abort the batch)
 - **Per-run isolation** -- Each invocation gets a unique `run_id` folder in S3; different runs never overwrite each other's CSV files
@@ -449,4 +487,5 @@ aws cloudformation delete-stack \
 | Claim fails with "Phone number not available" | The number was claimed between search and claim. Search again and pick a different number. |
 | Association failed | The number was claimed but the contact flow association failed. Associate manually in the Connect console, or release and re-claim. |
 | Stack deployment fails at test | Check the `PhoneManagerTestFunction` CloudWatch logs for details. Common cause: the Connect instance ARN or contact flow ARN is incorrect. |
-| Timeout on batch claim | Reduce batch size. Each number takes ~10-30s (poll interval). The default 300s timeout covers ~20 numbers. |
+| Auto-claim stopped early (`remaining > 0`) | The Lambda ran out of time. Re-invoke with the same `run_id` and the `remaining` count. Each invocation handles ~50-60 numbers at the default 900s timeout. |
+| Throttling warnings in logs | Normal for large batches. The retry decorator handles this automatically with exponential backoff. No action needed unless all retries are exhausted. |
