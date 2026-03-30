@@ -17,8 +17,8 @@ A serverless tool for searching, claiming (purchasing), and releasing US phone n
                  |    S3 Bucket     |
                  |  (CSV records)   |
                  +------------------+
-                   claimed_phone_numbers.csv
-                   released_phone_numbers.csv
+                   {prefix}/{run_id}/claimed_phone_numbers.csv
+                   {prefix}/{run_id}/released_phone_numbers.csv
 ```
 
 **Resources created by the stack:**
@@ -98,6 +98,7 @@ Expected outputs include `TestSummary: 6/6 tests passed` and `TestAllPassed: Tru
 | `LogLevel` | No | `INFO` | Lambda log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 | `LambdaTimeout` | No | `300` | Lambda timeout in seconds (30-900) |
 | `LambdaMemory` | No | `256` | Lambda memory in MB (128, 256, 512, 1024) |
+| `CsvRetentionDays` | No | `365` | Days to retain CSV files in S3 before auto-deletion (1-3650) |
 
 ---
 
@@ -211,6 +212,7 @@ In the example above, the first number gets `"General support"` (the shared fall
 {
   "statusCode": 200,
   "body": {
+    "run_id": "20260330-143022",
     "results": [
       {
         "phone_number": "+18625551234",
@@ -226,17 +228,19 @@ In the example above, the first number gets `"General support"` (the shared fall
 }
 ```
 
+The `run_id` in the response identifies the S3 folder where CSV records are stored. Pass the same `run_id` when releasing these numbers so the release updates the correct CSV files.
+
 Each claimed number is:
 1. Purchased and attached to your Connect instance with a description
 2. Polled until the claim is confirmed (`CLAIMED` status)
 3. Associated with the configured contact flow
-4. Recorded in `claimed_phone_numbers.csv` on S3
+4. Recorded in `{prefix}/{run_id}/claimed_phone_numbers.csv` on S3
 
 **Status values:** `claimed`, `association_failed`, `failed`
 
 ### Release phone numbers
 
-Pass the `phone_number_id` values returned from claim.
+Pass the `phone_number_id` values returned from claim. Include the `run_id` from the claim response so the release updates the correct CSV files.
 
 ```bash
 aws lambda invoke \
@@ -245,6 +249,7 @@ aws lambda invoke \
   --cli-binary-format raw-in-base64-out \
   --payload '{
     "action": "release",
+    "run_id": "20260330-143022",
     "phone_number_ids": ["a8a98137-538f-48a3-a97a-fcc74a3f5f59"]
   }' \
   output.json
@@ -255,6 +260,7 @@ aws lambda invoke \
 {
   "statusCode": 200,
   "body": {
+    "run_id": "20260330-143022",
     "results": [
       {
         "phone_number_id": "a8a98137-538f-48a3-a97a-fcc74a3f5f59",
@@ -271,8 +277,8 @@ aws lambda invoke \
 Each released number is:
 1. Disassociated from the contact flow (best-effort)
 2. Released back to the AWS phone number pool
-3. Updated to `released` in `claimed_phone_numbers.csv`
-4. Appended to `released_phone_numbers.csv`
+3. Updated to `released` in `{prefix}/{run_id}/claimed_phone_numbers.csv`
+4. Appended to `{prefix}/{run_id}/released_phone_numbers.csv`
 
 > **Warning:** Released numbers enter a **180-day cooldown** and cannot be reclaimed.
 
@@ -287,6 +293,7 @@ All actions accept these optional fields (default to CloudFormation parameter va
 | `instance_arn` | string | Override the Connect instance ARN |
 | `contact_flow_arn` | string | Override the contact flow ARN |
 | `region` | string | Override the AWS region |
+| `run_id` | string | Custom run identifier (default: auto-generated `YYYYMMDD-HHMMSS`) |
 
 ### Search
 
@@ -324,7 +331,20 @@ All actions accept these optional fields (default to CloudFormation parameter va
 
 ## CSV Records (S3)
 
-Records are stored in the S3 bucket at `<S3Prefix>/`.
+Each run produces its own CSV files in a separate S3 folder:
+
+```
+connect-phone-manager/
+  20260330-143022/                    # auto-generated run_id
+    claimed_phone_numbers.csv
+    released_phone_numbers.csv
+  20260330-160500/                    # a later run
+    claimed_phone_numbers.csv
+  batch-april-2026/                   # custom run_id
+    claimed_phone_numbers.csv
+```
+
+Records are stored at `<S3Prefix>/<run_id>/` and automatically deleted after `CsvRetentionDays` (default 365 days).
 
 ### claimed_phone_numbers.csv
 
@@ -362,7 +382,9 @@ Records are stored in the S3 bucket at `<S3Prefix>/`.
 - **Retry with exponential backoff** -- All Connect API calls automatically retry on `ThrottlingException`, `TooManyRequestsException`, `RequestLimitExceeded`, `ServiceUnavailable`, and `InternalServiceException` (up to 5 retries with jitter)
 - **Pagination** -- Phone number search follows `NextToken` across pages to return up to 100 results
 - **Batch operations** -- Claim and release support multiple numbers per invocation with per-number error isolation (one failure does not abort the batch)
-- **S3 versioning** -- CSV bucket has versioning enabled; old versions expire after 90 days
+- **Per-run isolation** -- Each invocation gets a unique `run_id` folder in S3; different runs never overwrite each other's CSV files
+- **S3 lifecycle** -- CSV files auto-expire after `CsvRetentionDays` (default 365); noncurrent versions expire after 90 days
+- **S3 versioning** -- CSV bucket has versioning enabled for accidental overwrite protection
 - **Automated testing** -- 6 validation tests run automatically on every stack deploy
 
 ---
