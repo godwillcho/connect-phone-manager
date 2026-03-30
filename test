@@ -1,0 +1,79 @@
+Timestamp
+	
+Message
+
+Timestamp
+	
+Message
+
+No older events at this moment. 
+Retry
+2026-03-30T16:31:27.415Z
+INIT_START Runtime Version: python:3.12.mainlinev2.v4 Runtime Version ARN: arn:aws:lambda:us-east-1::runtime:ffd8d8a0ee4551835e06b2706a3a0b06584e348ae2397a7414e9fda79f0976a0
+2026-03-30T16:31:27.767Z
+START RequestId: 4f6b3b34-59a4-4d62-b053-dbeff4e470bf Version: $LATEST
+2026-03-30T16:31:27.767Z
+[INFO] 2026-03-30T16:31:27.767Z 4f6b3b34-59a4-4d62-b053-dbeff4e470bf Invocation 4f6b3b34-59a4-4d62-b053-dbeff4e470bf — action=search
+2026-03-30T16:31:30.538Z
+[INFO]	2026-03-30T16:31:30.538Z	4f6b3b34-59a4-4d62-b053-dbeff4e470bf	Search returned 1 available number(s)
+
+[INFO] 2026-03-30T16:31:30.538Z 4f6b3b34-59a4-4d62-b053-dbeff4e470bf Search returned 1 available number(s)
+2026-03-30T16:31:30.548Z
+END RequestId: 4f6b3b34-59a4-4d62-b053-dbeff4e470bf
+2026-03-30T16:31:30.548Z
+REPORT RequestId: 4f6b3b34-59a4-4d62-b053-dbeff4e470bf Duration: 2781.30 ms Billed Duration: 3130 ms Memory Size: 256 MB Max Memory Used: 99 MB Init Duration: 348.50 ms
+2026-03-30T16:31:30.560Z
+START RequestId: d5d51078-e672-4a20-8352-5bcd93b8a1dd Version: $LATEST
+2026-03-30T16:31:30.561Z
+[INFO] 2026-03-30T16:31:30.561Z d5d51078-e672-4a20-8352-5bcd93b8a1dd Invocation d5d51078-e672-4a20-8352-5bcd93b8a1dd — action=search
+2026-03-30T16:31:31.594Z
+[INFO]	2026-03-30T16:31:31.594Z	d5d51078-e672-4a20-8352-5bcd93b8a1dd	Search returned 1 available number(s)
+
+[INFO] 2026-03-30T16:31:31.594Z d5d51078-e672-4a20-8352-5bcd93b8a1dd Search returned 1 available number(s)
+2026-03-30T16:31:31.608Z
+END RequestId: d5d51078-e672-4a20-8352-5bcd93b8a1dd
+2026-03-30T16:31:31.608Z
+REPORT RequestId: d5d51078-e672-4a20-8352-5bcd93b8a1dd Duration: 1047.72 ms Billed Duration: 1048 ms Memory Size: 256 MB Max Memory Used: 100 MB
+2026-03-30T16:31:31.652Z
+START RequestId: c5e2dc86-77be-4a46-a9d1-b67e86ba2a16 Version: $LATEST
+2026-03-30T16:31:31.653Z
+[INFO] 2026-03-30T16:31:31.653Z c5e2dc86-77be-4a46-a9d1-b67e86ba2a16 Invocation c5e2dc86-77be-4a46-a9d1-b67e86ba2a16 — action=None
+2026-03-30T16:31:31.653Z
+[WARNING] 2026-03-30T16:31:31.653Z c5e2dc86-77be-4a46-a9d1-b67e86ba2a16 Validation error: 'action' must be one of ('search', 'claim', 'release'), got ''
+2026-03-30T16:31:31.655Z
+END RequestId: c5e2dc86-77be-4a46-a9d1-b67e86ba2a16
+2026-03-30T16:31:31.655Z
+REPORT RequestId: c5e2dc86-77be-4a46-a9d1-b67e86ba2a16 Duration: 1.80 ms Billed Duration: 2 ms Memory Size: 256 MB Max Memory Used: 100 MB
+2026-03-30T16:31:31.686Z
+START RequestId: 26a4da5d-3591-460d-8d26-e88180725d37 Version: $LATEST
+2026-03-30T16:31:31.687Z
+[INFO] 2026-03-30T16:31:31.687Z 26a4da5d-3591-460d-8d26-e88180725d37 Invocation 26a4da5d-3591-460d-8d26-e88180725d37 — action=invalid
+2026-03-30T16:31:31.687Z
+[WARNING]	2026-03-30T16:31:31.687Z	26a4da5d-3591-460d-8d26-e88180725d37	Validation error: 'action' must be one of ('search', 'claim', 'release'), got 'invalid'
+
+[WARNING] 2026-03-30T16:31:31.687Z 26a4da5d-3591-460d-8d26-e88180725d37 Validation error: 'action' must be one of ('search', 'claim', 'release'), got 'invalid'
+2026-03-30T16:31:31.688Z
+END RequestId: 26a4da5d-3591-460d-8d26-e88180725d37
+2026-03-30T16:31:31.688Z
+REPORT RequestId: 26a4da5d-3591-460d-8d26-e88180725d37 Duration: 1.75 ms Billed Duration: 2 ms Memory Size: 256 MB Max Memory Used: 100 MB
+2026-03-30T16:31:31.723Z
+START RequestId: 95b2919f-66db-45a3-9ac9-70e83e355a86 Version: $LATEST
+2026-03-30T16:31:31.723Z
+[INFO] 2026-03-30T16:31:31.723Z 95b2919f-66db-45a3-9ac9-70e83e355a86 Invocation 95b2919f-66db-45a3-9ac9-70e83e355a86 — action=claim
+2026-03-30T16:31:31.723Z
+[WARNING] 2026-03-30T16:31:31.723Z 95b2919f-66db-45a3-9ac9-70e83e355a86 Validation error: 'phone_numbers' must be a non-empty list
+2026-03-30T16:31:31.725Z
+END RequestId: 95b2919f-66db-45a3-9ac9-70e83e355a86
+2026-03-30T16:31:31.725Z
+REPORT RequestId: 95b2919f-66db-45a3-9ac9-70e83e355a86 Duration: 1.94 ms Billed Duration: 2 ms Memory Size: 256 MB Max Memory Used: 100 MB
+2026-03-30T16:31:31.789Z
+START RequestId: 5e583c51-0c8b-40e4-b5c7-7037bed6bb8d Version: $LATEST
+2026-03-30T16:31:31.790Z
+[INFO] 2026-03-30T16:31:31.790Z 5e583c51-0c8b-40e4-b5c7-7037bed6bb8d Invocation 5e583c51-0c8b-40e4-b5c7-7037bed6bb8d — action=release
+2026-03-30T16:31:31.790Z
+[WARNING]	2026-03-30T16:31:31.790Z	5e583c51-0c8b-40e4-b5c7-7037bed6bb8d	Validation error: 'phone_number_ids' must be a non-empty list
+
+[WARNING] 2026-03-30T16:31:31.790Z 5e583c51-0c8b-40e4-b5c7-7037bed6bb8d Validation error: 'phone_number_ids' must be a non-empty list
+2026-03-30T16:31:31.792Z
+END RequestId: 5e583c51-0c8b-40e4-b5c7-7037bed6bb8d
+2026-03-30T16:31:31.792Z
