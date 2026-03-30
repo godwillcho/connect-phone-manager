@@ -18,7 +18,7 @@ from config import (
 
 
 def _s3_key(config: ConnectConfig, filename: str) -> str:
-    return f"{config.s3_prefix}/{filename}"
+    return f"{config.s3_prefix}/{config.run_id}/{filename}"
 
 
 # ── Generic helpers ─────────────────────────────────────────

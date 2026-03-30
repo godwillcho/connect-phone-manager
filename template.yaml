@@ -64,6 +64,15 @@ Parameters:
     AllowedValues: [128, 256, 512, 1024]
     Description: Lambda memory in MB.
 
+  CsvRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: >
+      Number of days to retain CSV record files in S3 before
+      automatic deletion.  Default is 365 days (1 year).
+
 Conditions:
   AutoBucketName: !Equals [!Ref S3BucketName, ""]
 
@@ -89,6 +98,10 @@ Resources:
             Status: Enabled
             NoncurrentVersionExpiration:
               NoncurrentDays: 90
+          - Id: ExpireCsvRecords
+            Status: Enabled
+            ExpirationInDays: !Ref CsvRetentionDays
+            Prefix: !Sub "${S3Prefix}/"
       Tags:
         - Key: Application
           Value: ConnectPhoneManager
@@ -219,6 +232,7 @@ Resources:
               region: str
               s3_bucket: str
               s3_prefix: str
+              run_id: str
 
           def _extract_instance_id(arn):
               try:
@@ -246,11 +260,13 @@ Resources:
               if not s3_bucket:
                   raise ValueError("'s3_bucket' must be in the event or S3_BUCKET env var")
               s3_prefix = event.get("s3_prefix") or os.environ.get("S3_PREFIX", DEFAULT_S3_PREFIX)
+              run_id = event.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
               return ConnectConfig(
                   instance_arn=instance_arn,
                   instance_id=_extract_instance_id(instance_arn),
                   contact_flow_arn=contact_flow_arn,
                   region=region, s3_bucket=s3_bucket, s3_prefix=s3_prefix,
+                  run_id=run_id,
               )
 
           # ── Retry decorator ───────────────────────────────────
@@ -346,7 +362,7 @@ Resources:
 
           # ── S3 CSV helpers ────────────────────────────────────
           def _s3_key(config, filename):
-              return f"{config.s3_prefix}/{filename}"
+              return f"{config.s3_prefix}/{config.run_id}/{filename}"
 
           def _read_csv(s3c, bucket, key):
               try:
@@ -594,11 +610,11 @@ Resources:
                   elif action == "claim":
                       res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
                       ok = sum(1 for r in res if r["status"] == "claimed")
-                      return _response(200, {"results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
+                      return _response(200, {"run_id": config.run_id, "results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
                   elif action == "release":
                       res = batch_release(cc, s3c, config, event["phone_number_ids"])
                       ok = sum(1 for r in res if r["status"] == "released")
-                      return _response(200, {"results": res, "summary": {"released": ok, "failed": len(res) - ok}})
+                      return _response(200, {"run_id": config.run_id, "results": res, "summary": {"released": ok, "failed": len(res) - ok}})
               except Exception:
                   logger.error("Unhandled exception:\n%s", traceback.format_exc())
                   return _response(500, {"error": "Internal server error", "request_id": request_id})

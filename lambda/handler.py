@@ -125,6 +125,7 @@ def _handle_claim(client, s3_client, config, event: dict) -> dict:
     claimed = sum(1 for r in results if r["status"] == "claimed")
     failed = len(results) - claimed
     return _response(200, {
+        "run_id": config.run_id,
         "results": results,
         "summary": {"claimed": claimed, "failed": failed},
     })
@@ -140,6 +141,7 @@ def _handle_release(client, s3_client, config, event: dict) -> dict:
     released = sum(1 for r in results if r["status"] == "released")
     failed = len(results) - released
     return _response(200, {
+        "run_id": config.run_id,
         "results": results,
         "summary": {"released": released, "failed": failed},
     })

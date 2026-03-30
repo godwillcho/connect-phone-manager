@@ -65,6 +65,7 @@ class ConnectConfig:
     region: str
     s3_bucket: str
     s3_prefix: str
+    run_id: str
 
 
 def extract_instance_id(instance_arn: str) -> str:
@@ -108,6 +109,9 @@ def build_config(event: dict) -> ConnectConfig:
         "S3_PREFIX", DEFAULT_S3_PREFIX
     )
 
+    from datetime import datetime, timezone
+    run_id = event.get("run_id") or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
     return ConnectConfig(
         instance_arn=instance_arn,
         instance_id=extract_instance_id(instance_arn),
@@ -115,4 +119,5 @@ def build_config(event: dict) -> ConnectConfig:
         region=region,
         s3_bucket=s3_bucket,
         s3_prefix=s3_prefix,
+        run_id=run_id,
     )
