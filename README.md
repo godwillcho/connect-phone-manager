@@ -106,7 +106,18 @@ Expected outputs include `TestSummary: 6/6 tests passed` and `TestAllPassed: Tru
 
 Invoke the Lambda with a JSON event. The `instance_arn` and `contact_flow_arn` fields are optional in the event payload -- they default to the values set during deployment via CloudFormation parameters.
 
-### Search for available numbers
+### Available actions
+
+| Action | What it does |
+|---|---|
+| `search` | Lists available numbers. Does **not** claim any. |
+| `claim` with `count` | Searches **and** claims automatically. Just say how many. |
+| `claim` with `phone_numbers` | Claims specific numbers you provide (from a prior search). |
+| `release` | Releases previously claimed numbers back to the pool. |
+
+> **Tip:** If you just want N phone numbers, skip `search` and go straight to `claim` with `count`. The `search` action is only useful if you want to preview available numbers before committing.
+
+### Search for available numbers (preview only)
 
 ```bash
 aws lambda invoke \
