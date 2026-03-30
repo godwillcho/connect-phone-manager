@@ -151,7 +151,9 @@ aws lambda invoke \
 
 ### Claim (purchase) phone numbers
 
-Supports batch claiming -- pass one or more numbers from the search results.
+Supports batch claiming -- pass one or more numbers from the search results. Every claimed number gets a description visible in the Amazon Connect console.
+
+**Simple claim (default description: "From phone number manager"):**
 
 ```bash
 aws lambda invoke \
@@ -166,6 +168,44 @@ aws lambda invoke \
   output.json
 ```
 
+**Shared description for all numbers in the batch:**
+
+```bash
+aws lambda invoke \
+  --function-name ConnectPhoneManager-connect-phone-manager \
+  --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "action": "claim",
+    "number_type": "DID",
+    "description": "Customer support lines",
+    "phone_numbers": ["+18625551234", "+18625555678"]
+  }' \
+  output.json
+```
+
+**Per-number descriptions (can mix with shared):**
+
+```bash
+aws lambda invoke \
+  --function-name ConnectPhoneManager-connect-phone-manager \
+  --region us-east-1 \
+  --cli-binary-format raw-in-base64-out \
+  --payload '{
+    "action": "claim",
+    "number_type": "DID",
+    "description": "General support",
+    "phone_numbers": [
+      "+18625551234",
+      {"number": "+18625555678", "description": "Sales hotline"},
+      {"number": "+18625559999", "description": "Billing dept"}
+    ]
+  }' \
+  output.json
+```
+
+In the example above, the first number gets `"General support"` (the shared fallback), while the other two get their own custom descriptions. Each description appears in the Amazon Connect console under the phone number's details.
+
 **Response:**
 ```json
 {
@@ -176,6 +216,7 @@ aws lambda invoke \
         "phone_number": "+18625551234",
         "phone_number_id": "a8a98137-538f-48a3-a97a-fcc74a3f5f59",
         "phone_number_arn": "arn:aws:connect:us-east-1:...:phone-number/a8a98137-...",
+        "description": "General support",
         "status": "claimed",
         "error": null
       }
@@ -186,7 +227,7 @@ aws lambda invoke \
 ```
 
 Each claimed number is:
-1. Purchased and attached to your Connect instance
+1. Purchased and attached to your Connect instance with a description
 2. Polled until the claim is confirmed (`CLAIMED` status)
 3. Associated with the configured contact flow
 4. Recorded in `claimed_phone_numbers.csv` on S3
@@ -258,11 +299,19 @@ All actions accept these optional fields (default to CloudFormation parameter va
 
 ### Claim
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `action` | string | Yes | `"claim"` |
-| `number_type` | string | Yes | `"DID"` or `"TOLL_FREE"` |
-| `phone_numbers` | string[] | Yes | E.164 numbers from search results |
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `action` | string | Yes | - | `"claim"` |
+| `number_type` | string | Yes | - | `"DID"` or `"TOLL_FREE"` |
+| `phone_numbers` | array | Yes | - | E.164 strings or objects (see below) |
+| `description` | string | No | `"From phone number manager"` | Shared description for all numbers |
+
+**`phone_numbers` accepts two formats, which can be mixed:**
+
+| Format | Example | Description used |
+|---|---|---|
+| Plain string | `"+18625551234"` | Shared `description` field (or default) |
+| Object | `{"number": "+18625551234", "description": "Sales"}` | Per-number description (overrides shared) |
 
 ### Release
 
@@ -289,6 +338,7 @@ Records are stored in the S3 bucket at `<S3Prefix>/`.
 | `contact_flow_arn` | Contact flow it was associated with |
 | `instance_id` | Connect instance ID |
 | `instance_arn` | Connect instance ARN |
+| `description` | Description visible in the Connect console |
 | `status` | `claimed`, `association_failed`, `released`, `release_failed` |
 
 ### released_phone_numbers.csv
