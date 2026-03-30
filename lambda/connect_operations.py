@@ -88,16 +88,16 @@ def search_available_numbers(
 # ── Claim ───────────────────────────────────────────────────
 
 @retry_with_backoff()
-def _claim(client, instance_arn: str, phone_number: str) -> dict:
-    return client.claim_phone_number(
-        TargetArn=instance_arn,
-        PhoneNumber=phone_number,
-    )
+def _claim(client, instance_arn: str, phone_number: str, description: str | None = None) -> dict:
+    kwargs = {"TargetArn": instance_arn, "PhoneNumber": phone_number}
+    if description:
+        kwargs["PhoneNumberDescription"] = description
+    return client.claim_phone_number(**kwargs)
 
 
-def claim_phone_number(client, config: ConnectConfig, phone_number: str) -> dict:
+def claim_phone_number(client, config: ConnectConfig, phone_number: str, description: str | None = None) -> dict:
     logger.info("Claiming %s on instance %s", phone_number, config.instance_id)
-    return _claim(client, config.instance_arn, phone_number)
+    return _claim(client, config.instance_arn, phone_number, description)
 
 
 # ── Poll claim status ──────────────────────────────────────
@@ -175,6 +175,7 @@ def batch_claim(
     config: ConnectConfig,
     phone_numbers: list[str],
     number_type: str,
+    description: str | None = None,
 ) -> list[dict]:
     """
     Claim multiple phone numbers sequentially.
@@ -195,7 +196,7 @@ def batch_claim(
 
         # 1. Claim
         try:
-            resp = claim_phone_number(client, config, phone_number)
+            resp = claim_phone_number(client, config, phone_number, description)
         except ClientError as exc:
             result["error"] = str(exc)
             logger.error("Claim failed for %s: %s", phone_number, exc)
@@ -241,6 +242,7 @@ def batch_claim(
             "contact_flow_arn": config.contact_flow_arn,
             "instance_id": config.instance_id,
             "instance_arn": config.instance_arn,
+            "description": description or "",
             "status": status,
         })
 

@@ -39,6 +39,7 @@ CLAIMED_CSV_HEADERS = [
     "contact_flow_arn",
     "instance_id",
     "instance_arn",
+    "description",
     "status",
 ]
 

@@ -197,7 +197,7 @@ Resources:
           CLAIMED_CSV_HEADERS = [
               "timestamp", "phone_number", "number_type", "phone_number_id",
               "phone_number_arn", "contact_flow_arn", "instance_id",
-              "instance_arn", "status",
+              "instance_arn", "description", "status",
           ]
           RELEASED_CSV_HEADERS = [
               "released_at", "phone_number", "number_type", "phone_number_id",
@@ -315,6 +315,9 @@ Resources:
                   for i, pn in enumerate(pns):
                       if not isinstance(pn, str) or not pn.startswith("+"):
                           raise ValueError(f"phone_numbers[{i}] must be E.164 (start with '+')")
+                  desc = event.get("description")
+                  if desc is not None and not isinstance(desc, str):
+                      raise ValueError("'description' must be a string")
               elif action == "release":
                   pids = event.get("phone_number_ids")
                   if not isinstance(pids, list) or len(pids) == 0:
@@ -421,12 +424,15 @@ Resources:
               return collected[:max_results]
 
           @retry_with_backoff()
-          def _claim_api(client, instance_arn, phone_number):
-              return client.claim_phone_number(TargetArn=instance_arn, PhoneNumber=phone_number)
+          def _claim_api(client, instance_arn, phone_number, description=None):
+              kwargs = {"TargetArn": instance_arn, "PhoneNumber": phone_number}
+              if description:
+                  kwargs["PhoneNumberDescription"] = description
+              return client.claim_phone_number(**kwargs)
 
-          def claim_phone_number(client, config, phone_number):
+          def claim_phone_number(client, config, phone_number, description=None):
               logger.info("Claiming %s on instance %s", phone_number, config.instance_id)
-              return _claim_api(client, config.instance_arn, phone_number)
+              return _claim_api(client, config.instance_arn, phone_number, description)
 
           @retry_with_backoff(max_retries=2)
           def _describe_api(client, pn_id):
@@ -463,12 +469,12 @@ Resources:
               logger.info("Released %s", pn_id)
 
           # ── Batch claim ───────────────────────────────────────
-          def batch_claim(client, s3c, config, phone_numbers, number_type):
+          def batch_claim(client, s3c, config, phone_numbers, number_type, description=None):
               results = []
               for pn in phone_numbers:
                   result = {"phone_number": pn, "phone_number_id": None, "phone_number_arn": None, "status": "failed", "error": None}
                   try:
-                      resp = claim_phone_number(client, config, pn)
+                      resp = claim_phone_number(client, config, pn, description)
                   except ClientError as exc:
                       result["error"] = str(exc)
                       logger.error("Claim failed for %s: %s", pn, exc)
@@ -500,7 +506,7 @@ Resources:
                       "number_type": number_type, "phone_number_id": pn_id,
                       "phone_number_arn": pn_arn, "contact_flow_arn": config.contact_flow_arn,
                       "instance_id": config.instance_id, "instance_arn": config.instance_arn,
-                      "status": status,
+                      "description": description or "", "status": status,
                   })
                   results.append(result)
               return results
@@ -567,7 +573,7 @@ Resources:
                       nums = search_available_numbers(cc, config, event.get("number_type", "DID"), event.get("prefix"), event.get("max_results", 10))
                       return _response(200, {"available_numbers": nums, "count": len(nums)})
                   elif action == "claim":
-                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"])
+                      res = batch_claim(cc, s3c, config, event["phone_numbers"], event["number_type"], event.get("description"))
                       ok = sum(1 for r in res if r["status"] == "claimed")
                       return _response(200, {"results": res, "summary": {"claimed": ok, "failed": len(res) - ok}})
                   elif action == "release":

@@ -79,6 +79,10 @@ def _validate_claim(event: dict) -> None:
                 f"phone_numbers[{idx}] must be an E.164 string starting with '+', got '{pn}'"
             )
 
+    desc = event.get("description")
+    if desc is not None and not isinstance(desc, str):
+        raise ValueError("'description' must be a string")
+
 
 def _validate_release(event: dict) -> None:
     phone_number_ids = event.get("phone_number_ids")
